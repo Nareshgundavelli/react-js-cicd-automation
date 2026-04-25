@@ -2,166 +2,194 @@ pipeline {
     agent any
 
     environment {
-        SERVER_IP = "65.0.104.110"        // Replace with your EC2 public IP
-        BACKEND_PORT = "5001"
-        FRONTEND_PORT = "3000"
-        DB_NAME = "saidb"
-        DB_USER = "saikumar"
-        DB_PASSWORD = "saikumar123"
-        DB_HOST = "127.0.0.1"
-        DB_PORT = "5432"
-        GIT_REPO = "https://github.com/saikumar2629/react-js-cicd-automation.git"
-        GIT_BRANCH = "main"
+        PATH = "/usr/bin:/usr/local/bin:${env.PATH}"
+        SCANNER_HOME = tool 'sonar-scanner'
+        KUBECONFIG = "/var/lib/jenkins/.kube/config"
+    }
+
+    options {
+        timestamps()
     }
 
     stages {
 
-        stage('Clone Repo') {
+        stage('Clean Workspace') {
             steps {
-                git branch: "${GIT_BRANCH}", url: "${GIT_REPO}"
+                deleteDir()
             }
         }
 
-        stage('Install Node.js') {
+        stage('Checkout Code') {
+            steps {
+                git branch: 'main',
+                url: 'https://github.com/Nareshgundavelli/react-js-cicd-automation.git'
+            }
+        }
+
+        stage('Debug Files') {
             steps {
                 sh '''
-                if ! command -v node >/dev/null 2>&1; then
-                  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-                  sudo apt-get install -y nodejs
-                fi
-                node -v
-                npm -v
+                echo "Current Path:"
+                pwd
+
+                echo "Workspace Files:"
+                ls -la
+
+                echo "YAML Files:"
+                find . -name "*.yaml" || true
                 '''
             }
         }
 
-        stage('Install & Start PostgreSQL') {
+        stage('Detect Project') {
+            steps {
+                script {
+                    env.FRONTEND_DIR = fileExists('frontend') ? 'frontend' : '.'
+                    env.BACKEND_DIR  = fileExists('backend') ? 'backend' : '.'
+
+                    echo "Frontend Directory: ${env.FRONTEND_DIR}"
+                    echo "Backend Directory : ${env.BACKEND_DIR}"
+                }
+            }
+        }
+
+        stage('Install Dependencies') {
+            parallel {
+
+                stage('Frontend Install') {
+                    steps {
+                        dir("${env.FRONTEND_DIR}") {
+                            sh 'npm install'
+                        }
+                    }
+                }
+
+                stage('Backend Install') {
+                    steps {
+                        dir("${env.BACKEND_DIR}") {
+                            sh 'npm install'
+                        }
+                    }
+                }
+
+            }
+        }
+
+        stage('Wait For SonarQube') {
             steps {
                 sh '''
-                if ! command -v psql >/dev/null 2>&1; then
-                    sudo apt-get update
-                    sudo apt-get install -y postgresql postgresql-contrib
-                fi
-
-                sudo systemctl enable postgresql
-                sudo systemctl restart postgresql
-
-                # Wait until PostgreSQL is ready
-                for i in {1..15}; do
-                    pg_isready -h ${DB_HOST} -p ${DB_PORT} && break
-                    echo "Waiting for PostgreSQL..."
-                    sleep 2
+                for i in {1..30}; do
+                  curl -s http://localhost:9000 >/dev/null && exit 0
+                  echo "Waiting for SonarQube..."
+                  sleep 10
                 done
+                echo "SonarQube not reachable"
+                exit 1
                 '''
             }
         }
 
-        stage('Setup PostgreSQL Database & User') {
+        stage('SonarQube Scan') {
+            steps {
+                withCredentials([string(credentialsId: 'sonar-token', variable: 'SONAR_TOKEN')]) {
+                    sh '''
+                    $SCANNER_HOME/bin/sonar-scanner \
+                      -Dsonar.projectKey=dynamic-app \
+                      -Dsonar.projectName=dynamic-app \
+                      -Dsonar.sources=. \
+                      -Dsonar.host.url=http://localhost:9000 \
+                      -Dsonar.token=$SONAR_TOKEN
+                    '''
+                }
+            }
+        }
+
+        stage('Trivy Scan') {
+            steps {
+                sh 'trivy fs . || true'
+            }
+        }
+
+        stage('Build Docker Images') {
             steps {
                 sh '''
-                sudo -u postgres psql << EOF
-                DO \$\$
-                BEGIN
-                  IF NOT EXISTS (SELECT FROM pg_database WHERE datname = '${DB_NAME}') THEN
-                    CREATE DATABASE ${DB_NAME};
-                  END IF;
-                END
-                \$\$;
-
-                DO \$\$
-                BEGIN
-                  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${DB_USER}') THEN
-                    CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASSWORD}';
-                  END IF;
-                END
-                \$\$;
-
-                GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};
-                EOF
+                docker build -t frontend-app:latest -f ${FRONTEND_DIR}/Dockerfile ${FRONTEND_DIR}
+                docker build -t backend-app:latest -f ${BACKEND_DIR}/Dockerfile ${BACKEND_DIR}
                 '''
             }
         }
 
-        stage('Deploy Application') {
+        stage('Import Images to K3s') {
             steps {
                 sh '''
-                sudo rm -rf /opt/app
-                sudo mkdir -p /opt/app
-                sudo cp -r backend frontend /opt/app/
-                sudo chown -R ubuntu:ubuntu /opt/app
+                docker save frontend-app:latest -o frontend.tar
+                docker save backend-app:latest -o backend.tar
+
+                sudo -n /usr/local/bin/k3s ctr images import frontend.tar
+                sudo -n /usr/local/bin/k3s ctr images import backend.tar
                 '''
             }
         }
 
-        stage('Configure Backend Environment') {
+        stage('Deploy to Kubernetes') {
             steps {
                 sh '''
-                sudo -u ubuntu bash -c '
-                cat > /opt/app/backend/.env << EOF
-DB_HOST=${DB_HOST}
-DB_PORT=${DB_PORT}
-DB_NAME=${DB_NAME}
-DB_USER=${DB_USER}
-DB_PASSWORD=${DB_PASSWORD}
-PORT=${BACKEND_PORT}
-EOF
-                '
+                export KUBECONFIG=/var/lib/jenkins/.kube/config
+
+                echo "Checking Cluster..."
+                kubectl get nodes
+
+                echo "Deploying Postgres..."
+                kubectl apply -f k8s/postgres.yaml --validate=false
+
+                echo "Deploying Backend..."
+                kubectl apply -f k8s/backend.yaml --validate=false
+
+                echo "Deploying Frontend..."
+                kubectl apply -f k8s/frontend.yaml --validate=false
+
+                echo "Restarting Deployments..."
+                kubectl rollout restart deployment backend || true
+                kubectl rollout restart deployment frontend || true
+
+                echo "Waiting for Rollout..."
+                kubectl rollout status deployment/backend --timeout=180s
+                kubectl rollout status deployment/frontend --timeout=180s
                 '''
             }
         }
 
-        stage('Start Backend') {
+        stage('Verify Deployment') {
             steps {
                 sh '''
-                sudo pkill -f "node server.js" || true
-                sudo -u ubuntu bash -c '
-                cd /opt/app/backend
-                npm install
-                nohup node server.js > backend.log 2>&1 &
-                '
-                sleep 15
-                echo "Backend running on port ${BACKEND_PORT}:"
-                ss -tulpn | grep ${BACKEND_PORT} || true
+                export KUBECONFIG=/var/lib/jenkins/.kube/config
+
+                echo "Pods:"
+                kubectl get pods -o wide
+
+                echo "Services:"
+                kubectl get svc
+
+                echo "Backend Health:"
+                curl -s http://localhost:30051/health || true
                 '''
             }
         }
+    }
 
-        stage('Wait Backend Ready') {
-  steps {
-    sh '''
-    echo "Waiting for backend health..."
-    for i in {1..20}; do
-      if curl -s http://127.0.0.1:${BACKEND_PORT}/health | grep OK; then
-        echo "Backend is healthy"
-        exit 0
-      fi
-      echo "Waiting..."
-      sleep 2
-    done
-    echo "Backend failed to start"
-    exit 1
-    '''
-  }
-}
+    post {
+        success {
+            echo '✅ PIPELINE SUCCESS'
+            echo 'Frontend URL: http://YOUR_PUBLIC_IP:30001'
+            echo 'Backend URL : http://YOUR_PUBLIC_IP:30051/health'
+        }
 
+        failure {
+            echo '❌ PIPELINE FAILED'
+        }
 
-        stage('Start Frontend') {
-            steps {
-                sh '''
-                sudo pkill -f react-scripts || true
-                sudo -u ubuntu bash -c "
-                cd /opt/app/frontend
-                npm install
-                export HOST=0.0.0.0
-                export PORT=${FRONTEND_PORT}
-                export REACT_APP_API_URL=http://${SERVER_IP}:${BACKEND_PORT}
-                nohup npm start > frontend.log 2>&1 &
-                "
-                sleep 5
-                echo "Frontend running on port ${FRONTEND_PORT}:"
-                ss -tulpn | grep ${FRONTEND_PORT} || true
-                '''
-            }
+        always {
+            cleanWs()
         }
     }
 }
