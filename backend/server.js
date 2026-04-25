@@ -19,10 +19,10 @@ app.get("/health", (req, res) => {
    PostgreSQL Connection
 ========================= */
 const pool = new Pool({
-  user: "saikumar",
-  host: "127.0.0.1",
-  database: "saidb",
-  password: "saikumar123",
+  user: process.env.DB_USER || "saikumar",
+  host: process.env.DB_HOST || "postgres",
+  database: process.env.DB_NAME || "saidb",
+  password: process.env.DB_PASSWORD || "saikumar123",
   port: 5432,
 });
 
