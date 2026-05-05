@@ -1,0 +1,133 @@
+name: CI/CD Pipeline
+
+on:
+pull_request:
+branches: [main]
+
+push:
+branches: [main]
+
+env:
+AWS_REGION: ap-south-1
+
+jobs:
+
+# ✅ 1. TEST ON PR
+
+test:
+runs-on: ubuntu-latest
+
+```
+steps:
+  - uses: actions/checkout@v4
+
+  - name: Backend test
+    run: |
+      cd backend
+      npm install
+      npm test
+
+  - name: Frontend test
+    run: |
+      cd frontend
+      npm install
+      npm test
+```
+
+# ✅ 2. BUILD + PUSH TO ECR
+
+build:
+needs: test
+if: github.event_name == 'push'
+runs-on: ubuntu-latest
+
+```
+steps:
+  - uses: actions/checkout@v4
+
+  - name: Configure AWS
+    uses: aws-actions/configure-aws-credentials@v4
+    with:
+      aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+      aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+      aws-region: ap-south-1
+
+  - name: Login to ECR
+    uses: aws-actions/amazon-ecr-login@v2
+
+  # FRONTEND
+  - name: Build frontend
+    run: docker build -t frontend ./frontend
+
+  - name: Tag frontend
+    run: docker tag frontend:latest ${{ secrets.ACCOUNT_ID }}.dkr.ecr.ap-south-1.amazonaws.com/octa-frontend-repo:latest
+
+  - name: Push frontend
+    run: docker push ${{ secrets.ACCOUNT_ID }}.dkr.ecr.ap-south-1.amazonaws.com/octa-frontend-repo:latest
+
+  # BACKEND
+  - name: Build backend
+    run: docker build -t backend ./backend
+
+  - name: Tag backend
+    run: docker tag backend:latest ${{ secrets.ACCOUNT_ID }}.dkr.ecr.ap-south-1.amazonaws.com/octa-backend-repo:latest
+
+  - name: Push backend
+    run: docker push ${{ secrets.ACCOUNT_ID }}.dkr.ecr.ap-south-1.amazonaws.com/octa-backend-repo:latest
+```
+
+# ✅ 3. SECURITY SCAN
+
+scan:
+needs: build
+runs-on: ubuntu-latest
+
+```
+steps:
+  - name: Scan backend image
+    uses: aquasecurity/trivy-action@master
+    with:
+      image-ref: backend:latest
+```
+
+# ✅ 4. DEPLOY TO EC2
+
+deploy:
+needs: scan
+runs-on: ubuntu-latest
+
+```
+steps:
+  - name: Deploy via SSH
+    uses: appleboy/ssh-action@v1.0.0
+    with:
+      host: ${{ secrets.EC2_HOST }}
+      username: ec2-user
+      key: ${{ secrets.EC2_SSH_KEY }}
+      script: |
+        aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin ${{ secrets.ACCOUNT_ID }}.dkr.ecr.ap-south-1.amazonaws.com
+
+        docker pull ${{ secrets.ACCOUNT_ID }}.dkr.ecr.ap-south-1.amazonaws.com/octa-backend-repo:latest
+        docker pull ${{ secrets.ACCOUNT_ID }}.dkr.ecr.ap-south-1.amazonaws.com/octa-frontend-repo:latest
+
+        docker stop backend || true
+        docker rm backend || true
+        docker run -d -p 5000:5000 --name backend ${{ secrets.ACCOUNT_ID }}.dkr.ecr.ap-south-1.amazonaws.com/octa-backend-repo:latest
+
+        docker stop frontend || true
+        docker rm frontend || true
+        docker run -d -p 80:80 --name frontend ${{ secrets.ACCOUNT_ID }}.dkr.ecr.ap-south-1.amazonaws.com/octa-frontend-repo:latest
+```
+
+# ✅ 5. MANUAL APPROVAL
+
+approve-prod:
+needs: deploy
+runs-on: ubuntu-latest
+environment:
+name: production
+
+```
+steps:
+  - run: echo "Waiting for approval"
+```
